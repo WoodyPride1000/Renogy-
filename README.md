@@ -69,3 +69,47 @@
 |                                                 |
 | [アナログ/I2Cピン側ヘッダ (A0〜A5, 5V, GND)]    |
 +-------------------------------------------------+
+
+```
+
+## 4. データ構造仕様
+### 4.1 EEPROM保存用 バイナリ構造体（27バイト）
+
+```text
+struct LogRecord {
+  uint16_t year;      // 2 bytes: 西暦 (例: 2026)
+  uint8_t  month;     // 1 byte : 月 (1-12)
+  uint8_t  day;       // 1 byte : 日 (1-31)
+  uint8_t  hour;      // 1 byte : 時 (0-23)
+  uint8_t  minute;    // 1 byte : 分 (0-59)
+  uint8_t  second;    // 1 byte : 秒 (0-59)
+  float    batV;      // 4 bytes: バッテリー電圧 [V]
+  uint8_t  soc;       // 1 byte : バッテリー残量 [%]
+  uint16_t pvW;       // 2 bytes: ソーラー発電電力 [W]
+  float    pvV;       // 4 bytes: ソーラーパネル電圧 [V]
+  float    pvA;       // 4 bytes: ソーラーパネル電流 [A]
+  float    chipTemp;  // 4 bytes: マイコン内蔵温度 [℃]
+};
+```
+### 4.2 SDカード出力 CSVフォーマット
+ファイル名: datalog.csv（追記モード O_APPEND）
+ヘッダー行: datetime,batV,soc,pvW,pvV,pvA,chipTemp
+データ行例: 2026-11-14 16:30:00,13.40,85,120,18.50,6.48,24.5
+
+## 5. シリアルコマンド仕様（メンテナンス機能）
+PCとUSB接続し、シリアルモニタ（ボーレート: 9600 bps / 改行コード: LF または 両方）から以下のコマンドを受け付ける。
+コマンド	入力例	機能説明
+SET:YYYY,MM,DD,HH,MM,SS	SET:2026,11,14,16,30,00	RTC（DS3231）の現在時刻を指定した日時に強制校正する
+TIME	TIME	RTC（DS3231）の現在時刻をシリアルモニタへ出力する
+DUMP	DUMP	プッシュボタン押下時と同様に、EEPROM内の全データをSDカードへ一括書き出しする
+## 6. ファームウェアソースコード
+
+
+### 実装時の重要メモ（設計書 3.2 補足）
+24FC1025のデータシート仕様上、**ピン3（A2）は必ず `VCC`（5V）に接続**してください（A2をGNDに落とすとチップが応答しません）。コード内のアドレス計算式は、この配線仕様に合わせて設計されています。
+
+<ElicitationsGroup message="実機での組み立て・テストに向けて、次のステップを選べます：">
+  <Elicitation label="3個の24FC1025が正しく配線できているか確認するI2Cスキャナ・テストコードを作成する" query="24FC1025を3個配線したあと、I2Cアドレス（0x50〜0x55）が正しく認識され、読み書きできるか検証する単体テストスケッチを作成してください。"/>
+  <Elicitation label="Arduinoの電源断・再起動時にも書き込みアドレス（writePointer）を引き継ぐ機能を追加する" query="Arduinoの電源が落ちても外付けEEPROMの書き込み位置（writePointer）が0に戻らないよう、ATmega328P内蔵EEPROMへポインタを保存するコードを追加してください。"/>
+</ElicitationsGroup>
+
