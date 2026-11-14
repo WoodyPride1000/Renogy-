@@ -1,12 +1,10 @@
 /*
    ====================================================================
-   Renogy Charge Controller Logger - （EEPROM 384KB + SDダンプ + コマンド制御）
-   ハードウェア構成:
-   - Arduino UNO
-   - XD-204 Data Logging Shield (SD + RTC DS3231)
-   - I2C EEPROM 24FC1025 (1Mbit = 128KB) × 3個 (計384KB)
-   - MAX3232 (Renogy RS-232 通信)
-   - プッシュボタン (ピン 4 -> GND: SD書き込みトリガー)
+   Renogy チャージコントローラー 高信頼性バッテリーロガー 最終完全版
+   - 外付けEEPROM 384KB (24FC1025 × 3) リングバッファ
+   - 12V電源(VIN)の抵抗分圧監視 (A0ピン) ＋ 低電圧カットオフ＆ヒステリシス自動復帰
+   - 内蔵EEPROMウェアレベリングによる writePointer 永続化
+   - プッシュボタン & シリアルコマンド (SET / TIME / DUMP) によるSD一括ダンプ
    ====================================================================
 */
 
@@ -16,12 +14,19 @@
 #include <SdFat.h>
 #include <Wire.h>
 #include <RTClib.h>
+#include <EEPROM.h>
 
-#define SD_CS_PIN     10
-#define LED_PIN       13
-#define BUTTON_PIN    4      // プッシュボタン（押すとLOW）
-#define RENOGY_RX     2
-#define RENOGY_TX     3
+#define SD_CS_PIN       10
+#define LED_PIN         13
+#define BUTTON_PIN      4      // プッシュボタン（押すとLOW）
+#define RENOGY_RX       2
+#define RENOGY_TX       3
+#define VIN_ANALOG_PIN  A0     // 12V電源監視ピン（33kΩ / 10kΩ 抵抗分圧）
+
+// 電圧閾値（ヒステリシス制御）
+const float LOW_VOLTAGE_CUTOFF = 10.8; // この値未満で保護モード（ロギング一時停止）
+const float RECOVERY_VOLTAGE   = 12.0; // この値以上に回復で通常ロギング再開
+bool isSystemActive = true;            // システムの稼働状態フラグ
 
 SoftwareSerial RenogySerial(RENOGY_RX, RENOGY_TX);
 ModbusMaster node;
@@ -29,7 +34,7 @@ RTC_DS3231 rtc;
 SdFat sd;
 SdFile file;
 
-// 1レコード分のデータ構造体（バイナリ保存用: 27バイト）
+// 1レコード分のデータ構造体（バイナリ保存用: 31バイト）
 struct LogRecord {
   uint16_t year;
   uint8_t  month;
@@ -37,20 +42,21 @@ struct LogRecord {
   uint8_t  hour;
   uint8_t  minute;
   uint8_t  second;
-  float    batV;
-  uint8_t  soc;
-  uint16_t pvW;
-  float    pvV;
-  float    pvA;
-  float    chipTemp;
+  float    batV;     // チャージコントローラー側バッテリ電圧
+  uint8_t  soc;      // SOC [%]
+  uint16_t pvW;      // 発電電力 [W]
+  float    pvV;      // ソーラーパネル電圧 [V]
+  float    pvA;      // ソーラーパネル電流 [A]
+  float    chipTemp; // マイコン内蔵温度 [℃]
+  float    vinV;     // Arduino入力電源電圧（12V系）[V]
 };
 
 const uint32_t MAX_EEPROM_SIZE = 393216; // 384KB (3Mbit)
 const uint16_t RECORD_SIZE = sizeof(LogRecord);
-const uint32_t MAX_RECORDS = MAX_EEPROM_SIZE / RECORD_SIZE; // 約14,563件保存可能
 
-uint32_t writePointer = 0; // 次に書き込むEEPROMのアドレス
+uint32_t writePointer = 0; 
 float chipTemp = 0.0;
+float currentVin = 0.0;
 
 struct {
   bool     connected = false;
@@ -61,7 +67,46 @@ struct {
   uint16_t pvW  = 0;
 } renogy;
 
+// 内蔵EEPROMウェアレベリング設定（1024バイト / 8バイト = 128スロット）
+const uint16_t INTERNAL_SLOTS = 128;
+
 // ====================================================================
+// 内蔵EEPROMから writePointer を復元
+uint32_t loadWritePointer() {
+  uint32_t maxPtr = 0;
+  for (uint16_t i = 0; i < INTERNAL_SLOTS; i++) {
+    uint32_t val;
+    EEPROM.get(i * 8, val);
+    if (val <= MAX_EEPROM_SIZE && val > maxPtr) {
+      maxPtr = val;
+    }
+  }
+  return maxPtr;
+}
+
+// 内蔵EEPROMへ writePointer をバックアップ
+void saveWritePointer(uint32_t ptr) {
+  static uint16_t currentSlot = 0;
+  if (ptr == 0) {
+    for (uint16_t i = 0; i < INTERNAL_SLOTS; i++) {
+      EEPROM.put(i * 8, (uint32_t)0);
+    }
+    currentSlot = 0;
+    return;
+  }
+  EEPROM.put(currentSlot * 8, ptr);
+  currentSlot = (currentSlot + 1) % INTERNAL_SLOTS;
+}
+
+// ====================================================================
+// 12V電源(VIN)電圧の読み取り（抵抗分圧: 33kΩ & 10kΩ）
+float readVinVoltage() {
+  int rawValue = analogRead(VIN_ANALOG_PIN);
+  float pinVoltage = (rawValue / 1023.0) * 5.0;
+  float vinVoltage = pinVoltage * ((33.0 + 10.0) / 10.0);
+  return vinVoltage;
+}
+
 // 内蔵温度取得
 float readInternalTemp() {
   ADMUX = (_BV(REFS1) | _BV(REFS0) | _BV(MUX3));
@@ -72,25 +117,25 @@ float readInternalTemp() {
 }
 
 // ====================================================================
-// 24FC1025 (3個 / 計384KB) へのバイナリ書き込み関数
+// 外付けEEPROM (384KB) へのバイナリ書き込み
 void writeRecordToEEPROM(LogRecord &rec) {
   if (writePointer + RECORD_SIZE > MAX_EEPROM_SIZE) {
-    Serial.println(F("EEPROM Memory Full! Overwriting from top (Ring Buffer)."));
+    Serial.println(F("EEPROM Full! Ring Buffer Overwriting from top."));
     writePointer = 0; 
   }
 
   uint8_t* p = (uint8_t*)&rec;
   for (uint16_t i = 0; i < RECORD_SIZE; i++) {
     uint32_t currAddr = writePointer + i;
-    uint8_t chip = currAddr / 131072;       // 0, 1, 2 (各128KB)
-    uint32_t chipAddr = currAddr % 131072;  // チップ内アドレス
+    uint8_t chip = currAddr / 131072;       // 0, 1, 2
+    uint32_t chipAddr = currAddr % 131072;  
     
     uint8_t baseA1A0 = 0;
-    if (chip == 0)      baseA1A0 = 0x00;    // A1=0, A0=0
-    else if (chip == 1) baseA1A0 = 0x01;    // A1=0, A0=1
-    else if (chip == 2) baseA1A0 = 0x02;    // A1=1, A0=0
+    if (chip == 0)      baseA1A0 = 0x00;    // 0x50/0x51
+    else if (chip == 1) baseA1A0 = 0x01;    // 0x52/0x53
+    else if (chip == 2) baseA1A0 = 0x02;    // 0x54/0x55
     
-    uint8_t blockBit = (chipAddr >> 16) & 0x01; // A16
+    uint8_t blockBit = (chipAddr >> 16) & 0x01;
     uint8_t devAddr = 0x50 | (baseA1A0 << 1) | blockBit;
     uint16_t wordAddr = chipAddr & 0xFFFF;
     
@@ -99,14 +144,15 @@ void writeRecordToEEPROM(LogRecord &rec) {
     Wire.write((uint8_t)(wordAddr & 0xFF));
     Wire.write(p[i]);
     Wire.endTransmission();
-    delay(5); // 内部書き込みサイクル待ち
+    delay(5);
   }
   
   writePointer += RECORD_SIZE;
+  saveWritePointer(writePointer);
 }
 
 // ====================================================================
-// 24FC1025 からレコードを読み出す関数
+// 外付けEEPROMから読み出し
 void readRecordFromEEPROM(uint32_t addr, LogRecord &rec) {
   uint8_t* p = (uint8_t*)&rec;
   for (uint16_t i = 0; i < RECORD_SIZE; i++) {
@@ -135,7 +181,7 @@ void readRecordFromEEPROM(uint32_t addr, LogRecord &rec) {
 }
 
 // ====================================================================
-// ボタン押下・シリアルコマンド時：EEPROMからSDカードへ一括ダンプ
+// SDカードへ一括ダンプ
 void flushEEPROMToSD() {
   if (writePointer == 0) {
     Serial.println(F("No data in EEPROM to flush."));
@@ -153,7 +199,7 @@ void flushEEPROMToSD() {
 
   if (file.open("datalog.csv", O_WRITE | O_CREAT | O_APPEND)) {
     if (file.fileSize() == 0) {
-      file.println(F("datetime,batV,soc,pvW,pvV,pvA,chipTemp"));
+      file.println(F("datetime,batV,soc,pvW,pvV,pvA,chipTemp,vinV"));
     }
 
     uint32_t totalRecords = writePointer / RECORD_SIZE;
@@ -174,7 +220,8 @@ void flushEEPROMToSD() {
       file.print(rec.pvW); file.print(',');
       file.print(rec.pvV, 2); file.print(',');
       file.print(rec.pvA, 2); file.print(',');
-      file.println(rec.chipTemp, 1);
+      file.print(rec.chipTemp, 1); file.print(',');
+      file.println(rec.vinV, 2);
     }
 
     file.close();
@@ -182,7 +229,8 @@ void flushEEPROMToSD() {
     Serial.print(totalRecords);
     Serial.println(F(" records to SD! Safe to remove SD."));
     
-    writePointer = 0; // ダンプ完了後にポインタをリセット
+    writePointer = 0; 
+    saveWritePointer(0);
   } else {
     Serial.println(F("SD File Open FAILED"));
   }
@@ -192,13 +240,12 @@ void flushEEPROMToSD() {
 }
 
 // ====================================================================
-// シリアルからのコマンド処理（SET / TIME / DUMP）
+// シリアルコマンド処理 (SET / TIME / DUMP)
 void checkSerialCommands() {
   if (Serial.available() > 0) {
     String input = Serial.readStringUntil('\n');
     input.trim();
     
-    // 1. 時刻設定コマンド: SET:YYYY,MM,DD,HH,MM,SS
     if (input.startsWith("SET:")) {
       int y, m, d, h, min, s;
       int parsed = sscanf(input.c_str(), "SET:%d,%d,%d,%d,%d,%d", &y, &m, &d, &h, &min, &s);
@@ -206,10 +253,9 @@ void checkSerialCommands() {
         rtc.adjust(DateTime(y, m, d, h, min, s));
         Serial.println(F(">>> RTC Time Updated Successfully via Serial! <<<"));
       } else {
-        Serial.println(F(">>> Error: Invalid format. Use SET:YYYY,MM,DD,HH,MM,SS <<<"));
+        Serial.println(F(">>> Error: Use format SET:YYYY,MM,DD,HH,MM,SS <<<"));
       }
     }
-    // 2. 現在時刻確認コマンド: TIME
     else if (input.equalsIgnoreCase("TIME")) {
       DateTime now = rtc.now();
       Serial.print(F(">>> Current RTC Time: "));
@@ -221,7 +267,6 @@ void checkSerialCommands() {
       if (now.second() < 10) Serial.print('0'); Serial.print(now.second());
       Serial.println(F(" <<<"));
     }
-    // 3. 手動SDダンプコマンド: DUMP
     else if (input.equalsIgnoreCase("DUMP")) {
       Serial.println(F(">>> Triggering SD Dump via Serial Command... <<<"));
       flushEEPROMToSD();
@@ -245,7 +290,7 @@ void setup() {
   RenogySerial.begin(9600);
   node.begin(1, RenogySerial);
 
-  Serial.println(F("=== Renogy EEPROM Logger Ready ==="));
+  Serial.println(F("=== Renogy Advanced Logger Ready ==="));
 
   // RTC初期化
   if (!rtc.begin()) { 
@@ -256,7 +301,11 @@ void setup() {
     rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
   }
 
-  // 起動確認LED
+  // writePointer復元
+  writePointer = loadWritePointer();
+  Serial.print(F("Restored Write Pointer: "));
+  Serial.println(writePointer);
+
   for (int i = 0; i < 3; i++) {
     digitalWrite(LED_PIN, HIGH); delay(200);
     digitalWrite(LED_PIN, LOW);  delay(200);
@@ -288,6 +337,7 @@ void logToEEPROM() {
   digitalWrite(LED_PIN, HIGH);
   DateTime now = rtc.now();
   chipTemp = readInternalTemp();
+  currentVin = readVinVoltage();
 
   LogRecord rec;
   rec.year = now.year();
@@ -302,10 +352,12 @@ void logToEEPROM() {
   rec.pvV = renogy.pvV;
   rec.pvA = renogy.pvA;
   rec.chipTemp = chipTemp;
+  rec.vinV = currentVin;
 
   writeRecordToEEPROM(rec);
 
-  Serial.print(F("[EEPROM Stored] Bat:")); Serial.print(rec.batV, 2);
+  Serial.print(F("[EEPROM Stored] Vin:")); Serial.print(rec.vinV, 2);
+  Serial.print(F("V Bat:")); Serial.print(rec.batV, 2);
   Serial.print(F("V SOC:")); Serial.print(rec.soc);
   Serial.print(F("% PV:")); Serial.print(rec.pvW);
   Serial.print(F("W Addr:")); Serial.println(writePointer);
@@ -314,7 +366,7 @@ void logToEEPROM() {
 }
 
 // ====================================================================
-// 待機中もボタンとシリアル入力を監視する
+// 待機ループ（電圧チェック・ヒステリシス制御・コマンド監視）
 void waitForNextMinute() {
   static uint8_t lastMinute = 255;
   if (lastMinute == 255) lastMinute = rtc.now().minute();
@@ -323,6 +375,7 @@ void waitForNextMinute() {
   while (millis() - startMillis < 60000) {
     checkSerialCommands();
 
+    // プッシュボタン監視
     if (digitalRead(BUTTON_PIN) == LOW) {
       delay(50);
       if (digitalRead(BUTTON_PIN) == LOW) {
@@ -341,7 +394,34 @@ void waitForNextMinute() {
 
 // ====================================================================
 void loop() {
-  readRenogyData();
-  logToEEPROM();
+  // 1. 毎サイクルの冒頭で入力電源(VIN)の電圧を常時チェック
+  currentVin = readVinVoltage();
+
+  // 2. ヒステリシス制御によるカットオフ＆復帰判定
+  if (isSystemActive && currentVin < LOW_VOLTAGE_CUTOFF) {
+    Serial.print(F("[WARNING] Low Vin detected ("));
+    Serial.print(currentVin, 2);
+    Serial.println(F("V). Pausing logging to protect system."));
+    isSystemActive = false; // 保護モードへ移行
+  } 
+  else if (!isSystemActive && currentVin >= RECOVERY_VOLTAGE) {
+    Serial.print(F("[INFO] Vin recovered ("));
+    Serial.print(currentVin, 2);
+    Serial.println(F("V). Resuming normal logging."));
+    isSystemActive = true;  // 通常モードへ自動復帰
+  }
+
+  // 3. システム稼働中の場合のみデータを取得・記録
+  if (isSystemActive) {
+    readRenogyData();
+    logToEEPROM();
+  } else {
+    // 停止モード時は無駄な書き込みをせず、省電力スタンバイ表示
+    Serial.print(F("[Standby] Low Vin: ")); 
+    Serial.print(currentVin, 2); 
+    Serial.println(F("V (Waiting for recovery >= 12.0V)"));
+  }
+
+  // 4. 次の1分まで待機（ボタン・シリアル監視）
   waitForNextMinute();
 }
