@@ -1,6 +1,6 @@
 /*
    ====================================================================
-   Renogy Charge Controller Logger - 完全版（EEPROM 384KB + SDダンプ + コマンド制御）
+   Renogy Charge Controller Logger - （EEPROM 384KB + SDダンプ + コマンド制御）
    ハードウェア構成:
    - Arduino UNO
    - XD-204 Data Logging Shield (SD + RTC DS3231)
